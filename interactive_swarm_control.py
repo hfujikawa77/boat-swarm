@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""
+Interactive Swarm Control Application
+対話式群制御アプリケーション - V/Hコマンドで東西/南北整列
+"""
+
+import time
+import math
+from pymavlink import mavutil
+from boat_arm_guided import BoatFleet
+import signal
+import sys
+
+# 接続先設定
+connection_strings = {
+    1: 'tcp:127.0.0.1:5762',  # 1号機
+    2: 'tcp:127.0.0.1:5772',  # 2号機
+    3: 'tcp:127.0.0.1:5782'   # 3号機
+}
+
+# フォーメーション設定
+SPACING = 10.0  # ボート間の距離（メートル）
+POSITION_TOLERANCE = 2.0  # 位置誤差許容範囲（メートル）
+TARGET_HEADING = 0  # 北向き（度）
+
+class SwarmController:
+    def __init__(self):
+        self.fleet = BoatFleet(list(connection_strings.values()))
+        self.waypoints = {}  # {boat_id: (lat, lon)}
+        self.running = True
+        
+    def connect_and_prepare(self):
+        """接続とARM確認"""
+        print("ボートに接続中...")
+        
+        if not self.fleet.connect():
+            print("接続に失敗しました")
+            return False
+            
+        # 状態確認
+        status = self.fleet.get_status()
+        print("\n現在の状態:")
+        for boat in status:
+            print(f"{boat['boat_id']}号機: モード={boat['mode']}, ARM={'Yes' if boat['armed'] else 'No'}")
+            
+        # ARMされていない場合はGUIDED/ARMを実行
+        needs_arming = any(not boat['armed'] or boat['mode'] != 'GUIDED' for boat in status)
+        
+        if needs_arming:
+            print("\nGUIDEDモード設定とARMが必要です...")
+            if not self.fleet.set_guided_and_arm():
+                print("GUIDED/ARM設定に失敗しました")
+                return False
+                
+        print("\n✓ 全機準備完了")
+        return True
+        
+    def get_boat_position(self, boat_index):
+        """指定したボートの現在位置を取得"""
+        master = self.fleet.masters[boat_index]
+        
+        # バッファをクリアして最新データを取得
+        while master.recv_match(blocking=False):
+            pass
+            
+        # 最新の位置情報を要求
+        attempts = 0
+        while attempts < 5:
+            msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=0.5)
+            if msg:
+                lat = msg.lat / 1e7
+                lon = msg.lon / 1e7
+                return lat, lon
+            attempts += 1
+                
+        return None, None
+        
+    def calculate_waypoints_e(self, base_lat, base_lon):
+        """E形成（東方向）のウェイポイント計算"""
+        # 地球の半径（メートル）
+        R = 6371000
+        
+        # 経度1度あたりの距離（メートル、緯度に依存）
+        lon_to_meters = R * math.pi / 180 * math.cos(math.radians(base_lat))
+        
+        waypoints = {
+            1: (base_lat, base_lon),  # 1号機は現在位置
+            2: (base_lat, base_lon + (SPACING / lon_to_meters)),  # 2号機は東に10m
+            3: (base_lat, base_lon + (2 * SPACING / lon_to_meters))  # 3号機は東に20m
+        }
+        
+        return waypoints
+        
+    def calculate_waypoints_w(self, base_lat, base_lon):
+        """W形成（西方向）のウェイポイント計算"""
+        # 地球の半径（メートル）
+        R = 6371000
+        
+        # 経度1度あたりの距離（メートル、緯度に依存）
+        lon_to_meters = R * math.pi / 180 * math.cos(math.radians(base_lat))
+        
+        waypoints = {
+            1: (base_lat, base_lon),  # 1号機は現在位置
+            2: (base_lat, base_lon - (SPACING / lon_to_meters)),  # 2号機は西に10m
+            3: (base_lat, base_lon - (2 * SPACING / lon_to_meters))  # 3号機は西に20m
+        }
+        
+        return waypoints
+        
+    def calculate_waypoints_s(self, base_lat, base_lon):
+        """S形成（南方向）のウェイポイント計算"""
+        # 地球の半径（メートル）
+        R = 6371000
+        
+        # 緯度1度あたりの距離（メートル）
+        lat_to_meters = R * math.pi / 180
+        
+        waypoints = {
+            1: (base_lat, base_lon),  # 1号機は現在位置
+            2: (base_lat - (SPACING / lat_to_meters), base_lon),  # 2号機は南に10m
+            3: (base_lat - (2 * SPACING / lat_to_meters), base_lon)  # 3号機は南に20m
+        }
+        
+        return waypoints
+        
+    def calculate_waypoints_n(self, base_lat, base_lon):
+        """N形成（北方向）のウェイポイント計算"""
+        # 地球の半径（メートル）
+        R = 6371000
+        
+        # 緯度1度あたりの距離（メートル）
+        lat_to_meters = R * math.pi / 180
+        
+        waypoints = {
+            1: (base_lat, base_lon),  # 1号機は現在位置
+            2: (base_lat + (SPACING / lat_to_meters), base_lon),  # 2号機は北に10m
+            3: (base_lat + (2 * SPACING / lat_to_meters), base_lon)  # 3号機は北に20m
+        }
+        
+        return waypoints
+        
+    def send_waypoint_to_boat(self, boat_index, target_lat, target_lon, heading=TARGET_HEADING):
+        """指定したボートにウェイポイントと方位を送信"""
+        master = self.fleet.masters[boat_index]
+        
+        # SET_POSITION_TARGET_GLOBAL_INTメッセージで位置と方位を送信
+        master.mav.set_position_target_global_int_send(
+            0,  # time_boot_ms
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_INT,
+            0b0000110111111000,  # type_mask (位置とyawを使用)
+            int(target_lat * 1e7),
+            int(target_lon * 1e7),
+            0,  # alt
+            0, 0, 0,  # velocity
+            0, 0, 0,  # acceleration
+            math.radians(heading),  # yaw (北向き = 0度)
+            0   # yaw_rate
+        )
+        
+    def execute_formation(self, command):
+        """フォーメーション実行"""
+        print(f"\n{command}フォーメーションを実行します...")
+        
+        # 1号機の現在位置を取得
+        print("1号機の位置を取得中...")
+        base_lat, base_lon = self.get_boat_position(0)
+        
+        if base_lat is None or base_lon is None:
+            print("1号機の位置を取得できませんでした")
+            return False
+            
+        print(f"1号機の位置: {base_lat:.6f}, {base_lon:.6f}")
+        
+        # ウェイポイント生成
+        if command == 'E':
+            self.waypoints = self.calculate_waypoints_e(base_lat, base_lon)
+            print("東方向（E）フォーメーションのウェイポイントを生成しました")
+        elif command == 'W':
+            self.waypoints = self.calculate_waypoints_w(base_lat, base_lon)
+            print("西方向（W）フォーメーションのウェイポイントを生成しました")
+        elif command == 'S':
+            self.waypoints = self.calculate_waypoints_s(base_lat, base_lon)
+            print("南方向（S）フォーメーションのウェイポイントを生成しました")
+        elif command == 'N':
+            self.waypoints = self.calculate_waypoints_n(base_lat, base_lon)
+            print("北方向（N）フォーメーションのウェイポイントを生成しました")
+        else:
+            print("無効なコマンドです")
+            return False
+            
+        # ウェイポイント表示
+        print("\nウェイポイント:")
+        for boat_id, (lat, lon) in self.waypoints.items():
+            print(f"  {boat_id}号機: {lat:.6f}, {lon:.6f}")
+            
+        # GUIDEDモードに設定（2号機と3号機のみ）
+        print("\n2号機と3号機をGUIDEDモードに設定中...")
+        self.set_all_guided_mode()
+        
+        # ウェイポイントアップロード（北向き指定）
+        print("\nウェイポイントをアップロード中（到着後は北向き）...")
+        for boat_id, (lat, lon) in self.waypoints.items():
+            boat_index = boat_id - 1
+            if boat_id == 1:
+                # 1号機は移動しない（現在位置を維持）
+                print(f"  {boat_id}号機: 現在位置を維持")
+            else:
+                # 2号機と3号機のみ移動
+                self.send_waypoint_to_boat(boat_index, lat, lon, TARGET_HEADING)
+                print(f"  {boat_id}号機: アップロード完了（北向き設定）")
+            
+        # 少し待機（コマンドが確実に届くように）
+        time.sleep(0.5)
+        
+        # 移動開始（2号機と3号機のみ）
+        print("\n2号機と3号機が移動開始!")
+        
+        # 移動完了監視
+        start_time = time.time()
+        monitoring_time = 0.5  # 0.5秒間監視
+        stable_count = 0  # 安定カウンター
+        last_distances = {}
+        
+        print("")  # 進捗表示用の改行
+        
+        while (time.time() - start_time) < monitoring_time:
+            distances = {}
+            all_close = True
+            
+            # 各ボートの距離を確認
+            for boat_id in range(1, 4):
+                boat_index = boat_id - 1
+                current_lat, current_lon = self.get_boat_position(boat_index)
+                
+                if current_lat and current_lon:
+                    target_lat, target_lon = self.waypoints[boat_id]
+                    distance = self.calculate_distance(current_lat, current_lon, target_lat, target_lon)
+                    distances[boat_id] = distance
+                    
+                    # 1号機は常に目標位置にいるとみなす
+                    if boat_id == 1:
+                        distances[boat_id] = 0.0
+                    elif distance > POSITION_TOLERANCE * 2:  # 許容範囲を緩める
+                        all_close = False
+                else:
+                    distances[boat_id] = last_distances.get(boat_id, 999.9)
+                    
+            # 進捗表示
+            if distances:
+                status_line = f"移動中... ({monitoring_time - (time.time() - start_time):.0f}秒) "
+                for boat_id, distance in distances.items():
+                    status_line += f"{boat_id}号機: {distance:.1f}m "
+                print(f"\r{status_line:<80}", end='', flush=True)
+                last_distances = distances.copy()
+                
+            # 全機が近づいたらカウント
+            if all_close:
+                stable_count += 1
+                if stable_count >= 3:  # 1.5秒間安定したら完了
+                    print("\n\n✓ 全機が目標位置付近に到達しました!")
+                    break
+            else:
+                stable_count = 0
+                
+            time.sleep(0.5)
+            
+        # 時間切れでも終了
+        else:
+            print("\n\n✓ 移動時間終了")
+            
+        print("\n待機中... 次のコマンドを入力してください。")
+            
+        return True  # 移動処理完了
+        
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """2点間の距離を計算（メートル）"""
+        R = 6371000
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return R * c
+        
+    def set_all_guided_mode(self):
+        """2号機と3号機をGUIDEDモードに設定"""
+        # ArduPilot RoverのGUIDEDモードは15
+        GUIDED_MODE = 15
+        
+        for i, master in enumerate(self.fleet.masters):
+            # Skip Unit 1 (index 0)
+            if i == 0:
+                print(f"  Unit {i+1}: Skipping mode change")
+                continue
+                
+            # GUIDEDモードに設定
+            for _ in range(3):
+                master.mav.set_mode_send(
+                    master.target_system,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    GUIDED_MODE
+                )
+                time.sleep(0.1)
+            
+            # Confirm mode change
+            mode_set = False
+            start_time = time.time()
+            while not mode_set and (time.time() - start_time < 5):
+                msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=0.1)
+                if msg and msg.custom_mode == GUIDED_MODE:
+                    mode_set = True
+                    print(f"  {i+1}号機: GUIDEDモード設定完了")
+                    break
+                    
+            if not mode_set:
+                print(f"  {i+1}号機: GUIDEDモード設定失敗")
+                
+    def set_all_loiter_mode(self):
+        """2号機と3号機をLOITERモードに設定"""
+        # ArduPilot RoverのLOITERモードは5
+        LOITER_MODE = 5
+        
+        for i, master in enumerate(self.fleet.masters):
+            # Skip Unit 1 (index 0)
+            if i == 0:
+                print(f"  Unit {i+1}: Skipping mode change")
+                continue
+                
+            # LOITERモードに設定
+            for _ in range(3):
+                master.mav.set_mode_send(
+                    master.target_system,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    LOITER_MODE
+                )
+                time.sleep(0.1)
+            
+            # Confirm mode change
+            mode_set = False
+            start_time = time.time()
+            while not mode_set and (time.time() - start_time < 5):
+                msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=0.1)
+                if msg and msg.custom_mode == LOITER_MODE:
+                    mode_set = True
+                    print(f"  {i+1}号機: LOITERモード設定完了")
+                    break
+                    
+            if not mode_set:
+                print(f"  {i+1}号機: LOITERモード設定失敗")
+        
+    def run_interactive(self):
+        """対話式メインループ"""
+        print("\n=== Interactive Swarm Control System ===")
+        print("Commands:")
+        print("  E - Align eastward (10m intervals from Unit 1, north facing)")
+        print("  W - Align westward (10m intervals from Unit 1, north facing)")
+        print("  S - Align southward (10m intervals from Unit 1, north facing)")
+        print("  N - Align northward (10m intervals from Unit 1, north facing)")
+        print("  L - Set Units 2 and 3 to LOITER mode")
+        print("  Q - Quit")
+        print("  You can also enter sequences like ENWSENWS")
+        print("")
+        
+        while self.running:
+            try:
+                command = input("\nPlease enter command (E/W/S/N/L/Q or sequence): ").strip().upper()
+                
+                if command == 'Q':
+                    print("Exiting...")
+                    break
+                elif all(c in 'EWSNL' for c in command) and len(command) > 0:
+                    # Execute sequence of commands (including L for LOITER)
+                    if len(command) > 1:
+                        print(f"\nExecuting sequence: {command}")
+                        for i, cmd in enumerate(command):
+                            print(f"\n--- Step {i+1}/{len(command)}: {cmd} ---")
+                            if cmd == 'L':
+                                print("Setting Units 2 and 3 to LOITER mode...")
+                                self.set_all_loiter_mode()
+                            else:
+                                self.execute_formation(cmd)
+                            if i < len(command) - 1:  # Wait between commands except the last one
+                                print("\nWaiting 2 seconds before next command...")
+                                time.sleep(0.5)
+                    else:
+                        # Single command
+                        if command == 'L':
+                            print("Setting Units 2 and 3 to LOITER mode...")
+                            self.set_all_loiter_mode()
+                        else:
+                            self.execute_formation(command)
+                else:
+                    print("Invalid command. Please enter E, W, S, N, L, Q, or a sequence like ENWSL.")
+                    
+            except KeyboardInterrupt:
+                print("\n\nInterrupted")
+                break
+                
+def main():
+    controller = SwarmController()
+    
+    # Signal handler setup
+    def signal_handler(sig, frame):
+        print("\n\nExiting...")
+        controller.running = False
+        controller.fleet.disconnect()
+        sys.exit(0)
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        # Connection and preparation
+        if controller.connect_and_prepare():
+            # Start interactive control
+            controller.run_interactive()
+            
+    except Exception as e:
+        print(f"\nError: {e}")
+        
+    finally:
+        controller.fleet.disconnect()
+        print("Connection terminated")
+
+if __name__ == "__main__":
+    main()
