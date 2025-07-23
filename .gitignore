@@ -91,3 +91,4 @@ site/
 .env
 .env.local
 *.pid
+eeprom.bin

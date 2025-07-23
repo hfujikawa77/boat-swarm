@@ -139,6 +139,83 @@ class SwarmController:
         
         return waypoints
         
+    def calculate_waypoints_c(self, base_lat, base_lon):
+        """C形成（円形）のウェイポイント計算"""
+        # 地球の半径（メートル）
+        R = 6371000
+        
+        # 円の半径（メートル）
+        radius = 15.0
+        
+        waypoints = {}
+        
+        # 3機を円周上に均等配置（120度間隔）
+        for i in range(3):
+            # 0度、120度、240度に配置
+            angle_rad = 2 * math.pi * i / 3
+            
+            # 北方向を0度として、時計回りに配置
+            north_offset = radius * math.cos(angle_rad)
+            east_offset = radius * math.sin(angle_rad)
+            
+            # 緯度の変化量
+            dlat = north_offset / R * (180 / math.pi)
+            # 経度の変化量（緯度による補正）
+            dlon = east_offset / (R * math.cos(math.radians(base_lat))) * (180 / math.pi)
+            
+            waypoints[i + 1] = (base_lat + dlat, base_lon + dlon)
+        
+        return waypoints
+        
+    def calculate_waypoints_r(self, rotation_angle=30):
+        """R形成（回転）- 現在の円形フォーメーションを時計回りに回転"""
+        if not hasattr(self, 'current_formation_center'):
+            # 初回は現在の各機体位置から円の中心を計算
+            positions = []
+            for i in range(3):
+                lat, lon = self.get_boat_position(i)
+                if lat and lon:
+                    positions.append((lat, lon))
+            
+            if len(positions) == 3:
+                # 3機の重心を円の中心とする
+                center_lat = sum(p[0] for p in positions) / 3
+                center_lon = sum(p[1] for p in positions) / 3
+                self.current_formation_center = (center_lat, center_lon)
+            else:
+                return None
+        
+        center_lat, center_lon = self.current_formation_center
+        
+        # 地球の半径（メートル）
+        R = 6371000
+        radius = 15.0
+        
+        waypoints = {}
+        
+        # 現在の角度位置を取得または初期化
+        if not hasattr(self, 'current_angles'):
+            self.current_angles = [0, 120, 240]  # 初期配置
+        
+        # 各機体を時計回りに回転
+        for i in range(3):
+            # 時計回りなので角度を減算
+            self.current_angles[i] = (self.current_angles[i] - rotation_angle) % 360
+            angle_rad = math.radians(self.current_angles[i])
+            
+            # 北方向を0度として配置
+            north_offset = radius * math.cos(angle_rad)
+            east_offset = radius * math.sin(angle_rad)
+            
+            # 緯度の変化量
+            dlat = north_offset / R * (180 / math.pi)
+            # 経度の変化量（緯度による補正）
+            dlon = east_offset / (R * math.cos(math.radians(center_lat))) * (180 / math.pi)
+            
+            waypoints[i + 1] = (center_lat + dlat, center_lon + dlon)
+        
+        return waypoints
+        
     def send_waypoint_to_boat(self, boat_index, target_lat, target_lon, heading=TARGET_HEADING):
         """指定したボートにウェイポイントと方位を送信"""
         master = self.fleet.masters[boat_index]
@@ -163,15 +240,15 @@ class SwarmController:
         """フォーメーション実行"""
         print(f"\n{command}フォーメーションを実行します...")
         
-        # 1号機の現在位置を取得
-        print("1号機の位置を取得中...")
+        # 1号機の現在位置を取得（Cコマンドの場合は中心として使用）
+        print("基準位置を取得中...")
         base_lat, base_lon = self.get_boat_position(0)
         
         if base_lat is None or base_lon is None:
-            print("1号機の位置を取得できませんでした")
+            print("基準位置を取得できませんでした")
             return False
             
-        print(f"1号機の位置: {base_lat:.6f}, {base_lon:.6f}")
+        print(f"基準位置: {base_lat:.6f}, {base_lon:.6f}")
         
         # ウェイポイント生成
         if command == 'E':
@@ -186,6 +263,24 @@ class SwarmController:
         elif command == 'N':
             self.waypoints = self.calculate_waypoints_n(base_lat, base_lon)
             print("北方向（N）フォーメーションのウェイポイントを生成しました")
+        elif command == 'C':
+            self.waypoints = self.calculate_waypoints_c(base_lat, base_lon)
+            print("円形（C）フォーメーションのウェイポイントを生成しました")
+            # 円の中心と初期角度を保存（base_latが中心）
+            self.current_formation_center = (base_lat, base_lon)
+            self.current_angles = [0, 120, 240]
+        elif command == 'R':
+            self.waypoints = self.calculate_waypoints_r()
+            if self.waypoints is None:
+                print("円形フォーメーションが設定されていません。先にCコマンドを実行してください。")
+                return False
+            print("回転（R）フォーメーションのウェイポイントを生成しました（30度時計回り）")
+        elif command == 'T':
+            self.waypoints = self.calculate_waypoints_r(rotation_angle=120)
+            if self.waypoints is None:
+                print("円形フォーメーションが設定されていません。先にCコマンドを実行してください。")
+                return False
+            print("回転（T）フォーメーションのウェイポイントを生成しました（120度時計回り）")
         else:
             print("無効なコマンドです")
             return False
@@ -195,82 +290,87 @@ class SwarmController:
         for boat_id, (lat, lon) in self.waypoints.items():
             print(f"  {boat_id}号機: {lat:.6f}, {lon:.6f}")
             
-        # GUIDEDモードに設定（2号機と3号機のみ）
-        print("\n2号機と3号機をGUIDEDモードに設定中...")
-        self.set_all_guided_mode()
+        # GUIDEDモードに設定
+        if command in ['C', 'R', 'T']:
+            # 円形フォーメーションと回転では全機移動
+            print("\n全機をGUIDEDモードに設定中...")
+            self.set_all_guided_mode(all_boats=True)
+        else:
+            # その他のフォーメーションでは2,3号機のみ
+            print("\n2号機と3号機をGUIDEDモードに設定中...")
+            self.set_all_guided_mode()
         
-        # ウェイポイントアップロード（北向き指定）
-        print("\nウェイポイントをアップロード中（到着後は北向き）...")
-        for boat_id, (lat, lon) in self.waypoints.items():
-            boat_index = boat_id - 1
-            if boat_id == 1:
-                # 1号機は移動しない（現在位置を維持）
-                print(f"  {boat_id}号機: 現在位置を維持")
-            else:
-                # 2号機と3号機のみ移動
-                self.send_waypoint_to_boat(boat_index, lat, lon, TARGET_HEADING)
-                print(f"  {boat_id}号機: アップロード完了（北向き設定）")
+        # ウェイポイントアップロード
+        if command in ['C', 'R', 'T']:
+            # 円形フォーメーションでは各機体が円の中心を向く
+            print("\nウェイポイントをアップロード中（各機体は円の中心を向く）...")
+            # 円の中心座標
+            center_lat, center_lon = self.current_formation_center
+            
+            for boat_id, (lat, lon) in self.waypoints.items():
+                boat_index = boat_id - 1
+                # 各機体が円の中心を向く
+                angle_to_center = math.atan2(center_lon - lon, center_lat - lat)
+                heading_to_center = math.degrees(angle_to_center)
+                heading_to_center = (90 - heading_to_center) % 360  # 北を0度とする座標系に変換
+                self.send_waypoint_to_boat(boat_index, lat, lon, heading_to_center)
+                print(f"  {boat_id}号機: アップロード完了（円の中心を向く）")
+        else:
+            # その他のフォーメーションでは北向き
+            print("\nウェイポイントをアップロード中（到着後は北向き）...")
+            for boat_id, (lat, lon) in self.waypoints.items():
+                boat_index = boat_id - 1
+                if boat_id == 1:
+                    # 1号機は移動しない（現在位置を維持）
+                    print(f"  {boat_id}号機: 現在位置を維持")
+                else:
+                    # 2,3号機のみ移動
+                    self.send_waypoint_to_boat(boat_index, lat, lon, TARGET_HEADING)
+                    print(f"  {boat_id}号機: アップロード完了（北向き設定）")
             
         # 少し待機（コマンドが確実に届くように）
-        time.sleep(0.5)
+        time.sleep(0.001)
         
-        # 移動開始（2号機と3号機のみ）
-        print("\n2号機と3号機が移動開始!")
+        # 移動開始
+        if command in ['C', 'R', 'T']:
+            print("\n全機が移動開始!")
+        else:
+            print("\n2号機と3号機が移動開始!")
         
         # 移動完了監視
-        start_time = time.time()
-        monitoring_time = 0.5  # 0.5秒間監視
-        stable_count = 0  # 安定カウンター
-        last_distances = {}
-        
-        print("")  # 進捗表示用の改行
-        
-        while (time.time() - start_time) < monitoring_time:
-            distances = {}
-            all_close = True
+        if command in ['R', 'T', 'L']:  # 回転とLOITERは監視なし
+            pass
+        else:  # E/N/W/S/Cは位置到達を確認
+            start_time = time.time()
+            monitoring_time = 0.5  # 0.5秒間監視
             
-            # 各ボートの距離を確認
-            for boat_id in range(1, 4):
-                boat_index = boat_id - 1
-                current_lat, current_lon = self.get_boat_position(boat_index)
+            while (time.time() - start_time) < monitoring_time:
+                distances = {}
+                all_close = True
                 
-                if current_lat and current_lon:
-                    target_lat, target_lon = self.waypoints[boat_id]
-                    distance = self.calculate_distance(current_lat, current_lon, target_lat, target_lon)
-                    distances[boat_id] = distance
+                # 各ボートの距離を確認
+                for boat_id in range(1, 4):
+                    boat_index = boat_id - 1
+                    current_lat, current_lon = self.get_boat_position(boat_index)
                     
-                    # 1号機は常に目標位置にいるとみなす
-                    if boat_id == 1:
-                        distances[boat_id] = 0.0
-                    elif distance > POSITION_TOLERANCE * 2:  # 許容範囲を緩める
-                        all_close = False
-                else:
-                    distances[boat_id] = last_distances.get(boat_id, 999.9)
-                    
-            # 進捗表示
-            if distances:
-                status_line = f"移動中... ({monitoring_time - (time.time() - start_time):.0f}秒) "
-                for boat_id, distance in distances.items():
-                    status_line += f"{boat_id}号機: {distance:.1f}m "
-                print(f"\r{status_line:<80}", end='', flush=True)
-                last_distances = distances.copy()
-                
-            # 全機が近づいたらカウント
-            if all_close:
-                stable_count += 1
-                if stable_count >= 3:  # 1.5秒間安定したら完了
-                    print("\n\n✓ 全機が目標位置付近に到達しました!")
+                    if current_lat and current_lon:
+                        target_lat, target_lon = self.waypoints[boat_id]
+                        distance = self.calculate_distance(current_lat, current_lon, target_lat, target_lon)
+                        distances[boat_id] = distance
+                        
+                        # E/W/S/Nコマンドでは1号機は常に目標位置にいるとみなす
+                        if boat_id == 1 and command in ['E', 'W', 'S', 'N']:
+                            distances[boat_id] = 0.0
+                        elif distance > POSITION_TOLERANCE * 2:  # 許容範囲を緩める
+                            all_close = False
+                            
+                # 全機が近づいたら完了
+                if all_close:
                     break
-            else:
-                stable_count = 0
-                
-            time.sleep(0.5)
+                    
+                time.sleep(0.1)
             
-        # 時間切れでも終了
-        else:
-            print("\n\n✓ 移動時間終了")
-            
-        print("\n待機中... 次のコマンドを入力してください。")
+        print("\n✓ 完了")
             
         return True  # 移動処理完了
         
@@ -283,14 +383,14 @@ class SwarmController:
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
         
-    def set_all_guided_mode(self):
-        """2号機と3号機をGUIDEDモードに設定"""
+    def set_all_guided_mode(self, all_boats=False):
+        """指定されたボートをGUIDEDモードに設定"""
         # ArduPilot RoverのGUIDEDモードは15
         GUIDED_MODE = 15
         
         for i, master in enumerate(self.fleet.masters):
-            # Skip Unit 1 (index 0)
-            if i == 0:
+            # Skip Unit 1 unless all_boats is True
+            if i == 0 and not all_boats:
                 print(f"  Unit {i+1}: Skipping mode change")
                 continue
                 
@@ -357,19 +457,22 @@ class SwarmController:
         print("  W - Align westward (10m intervals from Unit 1, north facing)")
         print("  S - Align southward (10m intervals from Unit 1, north facing)")
         print("  N - Align northward (10m intervals from Unit 1, north facing)")
+        print("  C - Circular formation (15m radius, all units face center)")
+        print("  R - Rotate formation clockwise by 30 degrees (requires C first)")
+        print("  T - Rotate formation clockwise by 60 degrees (Triangle, requires C first)")
         print("  L - Set Units 2 and 3 to LOITER mode")
         print("  Q - Quit")
-        print("  You can also enter sequences like ENWSENWS")
+        print("  You can also enter sequences like ENWSCRTL")
         print("")
         
         while self.running:
             try:
-                command = input("\nPlease enter command (E/W/S/N/L/Q or sequence): ").strip().upper()
+                command = input("\nPlease enter command (E/W/S/N/C/R/T/L/Q or sequence): ").strip().upper()
                 
                 if command == 'Q':
                     print("Exiting...")
                     break
-                elif all(c in 'EWSNL' for c in command) and len(command) > 0:
+                elif all(c in 'EWSNCRTL' for c in command) and len(command) > 0:
                     # Execute sequence of commands (including L for LOITER)
                     if len(command) > 1:
                         print(f"\nExecuting sequence: {command}")
@@ -381,8 +484,11 @@ class SwarmController:
                             else:
                                 self.execute_formation(cmd)
                             if i < len(command) - 1:  # Wait between commands except the last one
-                                print("\nWaiting 2 seconds before next command...")
-                                time.sleep(0.5)
+                                # R/T/Lは短め、E/N/W/S/Cは長め
+                                if cmd in ['R', 'T', 'L']:
+                                    time.sleep(0.001)
+                                else:
+                                    time.sleep(0.5)
                     else:
                         # Single command
                         if command == 'L':
@@ -391,7 +497,7 @@ class SwarmController:
                         else:
                             self.execute_formation(command)
                 else:
-                    print("Invalid command. Please enter E, W, S, N, L, Q, or a sequence like ENWSL.")
+                    print("Invalid command. Please enter E, W, S, N, C, R, T, L, Q, or a sequence like ENWSCRTL.")
                     
             except KeyboardInterrupt:
                 print("\n\nInterrupted")
