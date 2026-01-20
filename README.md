@@ -40,13 +40,11 @@ pip install pymavlink
 2. **Roverシミュレータの初回起動**
    - Mission Plannerを起動
    - 「シミュレーション」タブから「Rover」を選択
-   - Model: `Boat`を選択
-   - 「Start SITL」をクリックして一度起動
    - ArduRover.exeがダウンロード・配置されます
    - 起動確認後、シミュレータを閉じる
 
 3. **パラメータファイルの配置（重要：最初に実行）**
-   - `parms\motorboat_flat.parm`を`Documents\Mission Planner\sitl\default_params`フォルダにコピー
+   - `parms\motorboat_flat.parm`を`＜マイドキュメントのパス＞\Mission Planner\sitl\default_params`フォルダにコピー
    - このファイルがないと正しく動作しません
 
 ## 使用手順
@@ -73,13 +71,12 @@ start_boats.bat
 #### 接続手順
 
 1. Mission Plannerを起動
+2. 複数機体の同時接続：
+   - Mission Plannerの「接続」ボタンを右クリック→「接続オプション」→「TCP」「115200」を選択して「Connect」押下
 2. 各ボートに接続（TCP接続）：
    - ボート1: `TCP 127.0.0.1:5760`
    - ボート2: `TCP 127.0.0.1:5770`
    - ボート3: `TCP 127.0.0.1:5780`
-3. 複数機体の同時接続：
-   - Mission Plannerの「接続オプション」→「複数機体」を選択
-   - 各ポートに対して個別に接続を追加
 
 ### 3. Pythonスクリプトの実行
 
